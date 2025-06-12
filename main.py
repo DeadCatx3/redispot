@@ -4,12 +4,16 @@ import json
 import time
 import uuid
 import re
+import os
+import atexit # For graceful shutdown persistence
 
 # --- Configuration ---
 HOST = '0.0.0.0'  # Bind to all available interfaces for external access
 PORT = 6379       # Standard Redis port
 LOG_FILE = 'redis_honeypot.log'
-AUTH_REQUIRED = False # Set to True to require AUTH command
+STORAGE_FILE = 'redis_honeypot_data.json' # File for key-value store persistence
+PAYLOADS_DIR = 'payloads' # Directory to store captured SLAVEOF payloads
+AUTH_REQUIRED = False     # Set to True to require AUTH command
 EXPECTED_PASSWORD = "my_secure_password" # Change this if AUTH_REQUIRED is True
 
 # --- Default Dummy Keys for Honeypot Session ---
@@ -17,17 +21,19 @@ EXPECTED_PASSWORD = "my_secure_password" # Change this if AUTH_REQUIRED is True
 # in the emulated Redis database for each new client session.
 # These keys are designed to make the honeypot appear more realistic and
 # provide a starting point for attackers to interact with.
+# Note: For new data types (lists, hashes, sets, zsets), values should be
+# stored in a way that allows easy reconstruction, e.g., JSON strings or specific structures.
 DEFAULT_DUMMY_KEYS = {
     "web_cache:user_sessions": "a:1:{s:6:\"active\";b:1;}",
     "config:app_version": "1.0.5",
     "users:last_login:admin": "1718224800", # Example timestamp
     "temp_data:processing_queue_size": "50",
     "app:status": "online",
-    "cache:item:12345": "{\"name\":\"productX\",\"price\":99.99}",
-    "inventory:productA": "250",
     "service:metrics:requests_per_sec": "120",
-    "secret:api_key": "78tN4-8y7nx-9u23p", # A key to attract attention
-    "backup:last_run": "2025-06-12_01:00:00"
+    "secret:api_key": "89615-29901-27444-pl60", # A key to attract attention
+    "backup:last_run": "2025-06-12_01:00:00",
+    "online_users": {"Deadcatx3", "Guest1106", "Chapplin"}, # Example set
+    "leaderboard": [("Deadcatx3", 100), ("Guest1106", 90), ("Chapplin", 80)] # Example sorted set (member, score)
 }
 
 
@@ -58,6 +64,9 @@ class ClientAdapter(logging.LoggerAdapter):
 
 logger = ClientAdapter(logger, {'client_addr': 'N/A'})
 
+# Ensure payloads directory exists
+os.makedirs(PAYLOADS_DIR, exist_ok=True)
+
 # --- RESP (Redis Serialization Protocol) Parser and Serializer ---
 
 # RESP documentation reference: https://redis.io/docs/latest/develop/reference/protocol-spec/
@@ -71,15 +80,14 @@ def resp_encode(data):
     Encodes Python data types into RESP byte format.
 
     Args:
-        data: The Python object to encode (str, int, list, None).
+        data: The Python object to encode (str, int, list, None, bytes).
 
     Returns:
         bytes: The RESP encoded byte string.
     """
     if isinstance(data, str):
         # Simple String
-        if '\n' in data or '\r' in data:
-            # If the string contains newlines, it should be a Bulk String
+        if '\n' in data or '\r' in data or ' ' in data: # Use Bulk String if it contains spaces or newlines
             return f"${len(data)}\r\n{data}\r\n".encode('utf-8')
         return f"+{data}\r\n".encode('utf-8')
     elif isinstance(data, int):
@@ -100,7 +108,13 @@ def resp_encode(data):
         error_msg = str(data)
         return f"-ERR {error_msg}\r\n".encode('utf-8')
     else:
-        raise ValueError(f"Unsupported data type for RESP encoding: {type(data)}")
+        # Attempt to convert other types to string for bulk string encoding
+        try:
+            str_data = str(data)
+            return f"${len(str_data)}\r\n{str_data}\r\n".encode('utf-8')
+        except Exception:
+            raise ValueError(f"Unsupported data type for RESP encoding: {type(data)}")
+
 
 async def _read_until_crlf(reader):
     """Reads bytes from the reader until a CRLF (\\r\\n) is encountered."""
@@ -179,8 +193,74 @@ class RedisHoneypot:
         self.in_transaction = False
         self.master_info = None # For SLAVEOF
 
+        # Load data from disk on initialization
+        self._load_data_from_disk()
+
         # Populate the default database (db0) with dummy keys for each new session
-        self.databases[0].update(DEFAULT_DUMMY_KEYS)
+        # This will override any existing data from disk for the dummy keys if they conflict
+        # but ensures the honeypot always starts with expected dummy data.
+        self._populate_dummy_keys()
+
+    def _load_data_from_disk(self):
+        """Loads the key-value store from the persistence file."""
+        if os.path.exists(STORAGE_FILE):
+            try:
+                with open(STORAGE_FILE, 'r') as f:
+                    data = json.load(f)
+                    # Convert list/set/zset representations back to native Python types
+                    for db_idx, db_data in data.items():
+                        current_db = {}
+                        for k, v_meta in db_data.items():
+                            if isinstance(v_meta, dict) and 'type' in v_meta and 'value' in v_meta:
+                                if v_meta['type'] == 'list':
+                                    current_db[k] = v_meta['value']
+                                elif v_meta['type'] == 'hash':
+                                    current_db[k] = v_meta['value']
+                                elif v_meta['type'] == 'set':
+                                    current_db[k] = set(v_meta['value'])
+                                elif v_meta['type'] == 'zset':
+                                    current_db[k] = [(member, score) for member, score in v_meta['value']]
+                                else:
+                                    current_db[k] = v_meta['value'] # Assume string if unknown type
+                            else:
+                                current_db[k] = v_meta # Assume string if not dict meta
+                        self.databases[int(db_idx)] = current_db
+                logger.info("Loaded data from %s", STORAGE_FILE, extra={'client_addr': 'SERVER'})
+            except (json.JSONDecodeError, IOError) as e:
+                logger.error("Failed to load data from %s: %s", STORAGE_FILE, e, extra={'client_addr': 'SERVER'})
+        else:
+            logger.info("No persistence file found at %s. Starting with empty databases.", STORAGE_FILE, extra={'client_addr': 'SERVER'})
+
+    def _save_data_to_disk(self):
+        """Saves the key-value store to the persistence file."""
+        serializable_data = {}
+        for db_idx, db_data in self.databases.items():
+            serializable_db = {}
+            for k, v in db_data.items():
+                if isinstance(v, list):
+                    serializable_db[k] = {'type': 'list', 'value': v}
+                elif isinstance(v, dict):
+                    serializable_db[k] = {'type': 'hash', 'value': v}
+                elif isinstance(v, set):
+                    serializable_db[k] = {'type': 'set', 'value': list(v)} # Sets are not JSON serializable directly
+                elif isinstance(v, list) and all(isinstance(x, tuple) and len(x) == 2 for x in v): # Heuristic for zset
+                    serializable_db[k] = {'type': 'zset', 'value': [[m, s] for m, s in v]} # Tuples are not JSON serializable directly
+                else:
+                    serializable_db[k] = v # Assume string for other types
+            serializable_data[str(db_idx)] = serializable_db
+        
+        try:
+            with open(STORAGE_FILE, 'w') as f:
+                json.dump(serializable_data, f, indent=4)
+            logger.info("Saved data to %s", STORAGE_FILE, extra={'client_addr': 'SERVER'})
+        except IOError as e:
+            logger.error("Failed to save data to %s: %s", STORAGE_FILE, e, exc_info=True, extra={'client_addr': 'SERVER'})
+
+    def _populate_dummy_keys(self):
+        """Populates db0 with default dummy keys."""
+        for key, value in DEFAULT_DUMMY_KEYS.items():
+            self.databases[0][key] = value
+        logger.info("Populated DB0 with default dummy keys.", extra={'client_addr': 'SERVER'})
 
     def get_current_db(self):
         """Returns the currently selected database."""
@@ -239,6 +319,30 @@ class RedisHoneypot:
             "DISCARD": self.handle_discard,
             "SLAVEOF": self.handle_slaveof,
             "AUTH": self.handle_auth,
+            # Hash Commands
+            "HSET": self.handle_hset,
+            "HGET": self.handle_hget,
+            "HGETALL": self.handle_hgetall,
+            "HDEL": self.handle_hdel,
+            "HEXISTS": self.handle_hexists,
+            # List Commands
+            "LPUSH": self.handle_lpush,
+            "RPUSH": self.handle_rpush,
+            "LPOP": self.handle_lpop,
+            "RPOP": self.handle_rpop,
+            "LRANGE": self.handle_lrange,
+            "LLEN": self.handle_llen,
+            # Set Commands
+            "SADD": self.handle_sadd,
+            "SMEMBERS": self.handle_smembers,
+            "SREM": self.handle_srem,
+            "SISMEMBER": self.handle_sismember,
+            "SCARD": self.handle_scard,
+            # Sorted Set Commands (simplified)
+            "ZADD": self.handle_zadd,
+            "ZRANGE": self.handle_zrange,
+            "ZREM": self.handle_zrem,
+            "ZCARD": self.handle_zcard,
             # Add other common commands for realism, even if just returning OK
             "CLIENT": self.handle_generic_ok,
             "COMMAND": self.handle_generic_ok,
@@ -246,14 +350,6 @@ class RedisHoneypot:
             "TTL": self.handle_ttl,
             "INCR": self.handle_incr,
             "DECR": self.handle_decr,
-            "LPUSH": self.handle_generic_ok,
-            "RPUSH": self.handle_generic_ok,
-            "LPOP": self.handle_generic_nil,
-            "RPOP": self.handle_generic_nil,
-            "LRANGE": self.handle_generic_empty_array,
-            "SADD": self.handle_generic_ok,
-            "SMEMBERS": self.handle_generic_empty_array,
-            "SREM": self.handle_generic_ok,
         }
 
         handler = handlers.get(command)
@@ -261,6 +357,10 @@ class RedisHoneypot:
             try:
                 response = await handler(args, client_addr)
                 logger.info("Handled command '%s' (args: %s)", command, args, extra=log_extra)
+                # Automatically save data on successful modification commands
+                if command in ["SET", "DEL", "FLUSHALL", "FLUSHDB", "HSET", "HDEL",
+                               "LPUSH", "RPUSH", "LPOP", "RPOP", "SADD", "SREM", "ZADD", "ZREM"]:
+                    self._save_data_to_disk()
                 return response
             except Exception as e:
                 logger.error("Error handling command '%s': %s", command, e, exc_info=True, extra=log_extra)
@@ -296,7 +396,8 @@ class RedisHoneypot:
 
     async def handle_info(self, args, client_addr):
         # Fabricated INFO output for realism and to guide attackers
-        info_output = """
+        # Updated keyspace to reflect potential dummy data
+        info_output = f"""
 # Server
 redis_version:6.0.9
 redis_git_sha1:00000000
@@ -309,8 +410,8 @@ gcc_version:9.3.0
 process_id:12345
 run_id:fedcba9876543210
 tcp_port:6379
-uptime_in_seconds:3600
-uptime_in_days:0
+uptime_in_seconds:{int(time.time() - time.time() // 86400 * 86400)}
+uptime_in_days:{int(time.time() // 86400)}
 hz:10
 lru_clock:12345678
 executable:/usr/local/bin/redis-server
@@ -391,8 +492,8 @@ used_cpu_sys_children:0.00
 used_cpu_user_children:0.00
 
 # Keyspace
-db0:keys=10,expires=0,avg_ttl=0
-db1:keys=0,expires=0,avg_ttl=0
+db0:keys={len(self.databases[0])},expires=0,avg_ttl=0
+db1:keys={len(self.databases[1])},expires=0,avg_ttl=0
 """
         return resp_encode(info_output.strip())
 
@@ -401,7 +502,7 @@ db1:keys=0,expires=0,avg_ttl=0
             return resp_encode(RESPError("ERR wrong number of arguments for 'set' command"))
         key = args[0]
         value = args[1]
-        self.get_current_db()[key] = value
+        self.get_current_db()[key] = value # Store as string by default
         logger.info("SET key '%s' to value '%s'", key, value, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
         return resp_encode("OK")
 
@@ -410,6 +511,9 @@ db1:keys=0,expires=0,avg_ttl=0
             return resp_encode(RESPError("ERR wrong number of arguments for 'get' command"))
         key = args[0]
         value = self.get_current_db().get(key)
+        # Redis GET returns nil if key is not a string or doesn't exist
+        if value is None or not isinstance(value, str):
+            value = None
         logger.info("GET key '%s' (value: %s)", key, value, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
         return resp_encode(value)
 
@@ -450,16 +554,20 @@ db1:keys=0,expires=0,avg_ttl=0
         for db_index in self.databases:
             self.databases[db_index].clear()
         logger.warning("FLUSHALL executed. All databases cleared.", extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+        self._populate_dummy_keys() # Re-populate dummy keys after flushall
         return resp_encode("OK")
 
     async def handle_flushdb(self, args, client_addr):
         self.get_current_db().clear()
         logger.warning("FLUSHDB executed on DB %d. Current database cleared.", self.current_db_index, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+        if self.current_db_index == 0:
+            self._populate_dummy_keys() # Re-populate dummy keys if db0 is flushed
         return resp_encode("OK")
 
     async def handle_save(self, args, client_addr):
         # Simulate blocking behavior
         logger.info("SAVE command received. Simulating blocking save operation...", extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+        self._save_data_to_disk() # Force a save
         await asyncio.sleep(0.1) # Small delay to simulate work
         logger.info("SAVE simulation complete.", extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
         return resp_encode("OK")
@@ -544,9 +652,12 @@ db1:keys=0,expires=0,avg_ttl=0
             return resp_encode(RESPError("ERR wrong number of arguments for 'eval' command"))
         
         lua_script = args[0]
-        num_keys = int(args[1])
-        keys = args[2 : 2 + num_keys]
-        eval_args = args[2 + num_keys :]
+        try:
+            num_keys = int(args[1])
+            keys = args[2 : 2 + num_keys]
+            eval_args = args[2 + num_keys :]
+        except ValueError:
+            return resp_encode(RESPError("ERR invalid number of keys"))
 
         logger.critical(
             "EVAL command with Lua script captured! Script: \n---\n%s\n---\nKeys: %s, Args: %s",
@@ -577,17 +688,15 @@ db1:keys=0,expires=0,avg_ttl=0
             cmd = cmd_parts[0].upper()
             cmd_args = cmd_parts[1:]
             
-            # Re-dispatch the queued command using a simplified handler (no transaction check)
-            # This is a simplified approach. A full implementation would need to
-            # carefully handle error accumulation and atomicity.
             try:
-                # Get the original handler from the dispatch table (ensure it's awaitable)
-                handler = self.handlers_for_exec.get(cmd)
+                # Get the handler directly from the main handlers list (avoiding transaction recursion)
+                handler = self._get_exec_handler(cmd)
                 if handler:
-                    result = await handler(cmd_args, client_addr)
+                    result_bytes = await handler(cmd_args, client_addr)
                     # For EXEC, the response should be the actual result of the command
-                    # or an error. We simulate this by directly encoding the result.
-                    results.append(result)
+                    # after being decoded. We store the raw RESP bytes here to be
+                    # re-encoded as an array of results.
+                    results.append(result_bytes)
                 else:
                     results.append(resp_encode(RESPError(f"ERR unknown command in transaction: {cmd}")))
             except Exception as e:
@@ -597,6 +706,24 @@ db1:keys=0,expires=0,avg_ttl=0
         self.transaction_queue = []
         return resp_encode(results)
 
+    def _get_exec_handler(self, command):
+        # This helper returns the appropriate handler for EXEC'd commands.
+        # It's a simplified mapping and doesn't re-check authentication or transaction state.
+        handlers = {
+            "SET": self.handle_set, "GET": self.handle_get, "DEL": self.handle_del,
+            "EXISTS": self.handle_exists, "KEYS": self.handle_keys, "FLUSHALL": self.handle_flushall,
+            "FLUSHDB": self.handle_flushdb, "SAVE": self.handle_save, "SELECT": self.handle_select,
+            "DBSIZE": self.handle_dbsize, "CONFIG": self.handle_config, "EVAL": self.handle_eval,
+            "EVALSHA": self.handle_eval, "PING": self.handle_ping, "AUTH": self.handle_auth,
+            "HSET": self.handle_hset, "HGET": self.handle_hget, "HGETALL": self.handle_hgetall, "HDEL": self.handle_hdel, "HEXISTS": self.handle_hexists,
+            "LPUSH": self.handle_lpush, "RPUSH": self.handle_rpush, "LPOP": self.handle_lpop, "RPOP": self.handle_rpop, "LRANGE": self.handle_lrange, "LLEN": self.handle_llen,
+            "SADD": self.handle_sadd, "SMEMBERS": self.handle_smembers, "SREM": self.handle_srem, "SISMEMBER": self.handle_sismember, "SCARD": self.handle_scard,
+            "ZADD": self.handle_zadd, "ZRANGE": self.handle_zrange, "ZREM": self.handle_zrem, "ZCARD": self.handle_zcard,
+            "CLIENT": self.handle_generic_ok, "COMMAND": self.handle_generic_ok, "ECHO": self.handle_echo,
+            "TTL": self.handle_ttl, "INCR": self.handle_incr, "DECR": self.handle_decr,
+        }
+        return handlers.get(command)
+
     async def handle_discard(self, args, client_addr):
         if not self.in_transaction:
             return resp_encode(RESPError("ERR DISCARD without MULTI"))
@@ -605,53 +732,20 @@ db1:keys=0,expires=0,avg_ttl=0
         logger.info("DISCARD command received. Transaction discarded.", extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
         return resp_encode("OK")
 
-    # Helper for EXEC to avoid re-entering transaction mode
-    @property
-    def handlers_for_exec(self):
-        # This is a simplified way to get handlers without transaction check
-        # In a real system, you'd design `handle_command` to have an internal flag
-        # or a different dispatch for transaction execution.
-        return {
-            "SET": self.handle_set,
-            "GET": self.handle_get,
-            "DEL": self.handle_del,
-            "EXISTS": self.handle_exists,
-            "KEYS": self.handle_keys,
-            "FLUSHALL": self.handle_flushall,
-            "FLUSHDB": self.handle_flushdb,
-            "SAVE": self.handle_save,
-            "SELECT": self.handle_select,
-            "DBSIZE": self.handle_dbsize,
-            "CONFIG": self.handle_config,
-            "EVAL": self.handle_eval,
-            "EVALSHA": self.handle_eval,
-            "PING": self.handle_ping,
-            "AUTH": self.handle_auth,
-            "CLIENT": self.handle_generic_ok,
-            "COMMAND": self.handle_generic_ok,
-            "ECHO": self.handle_echo,
-            "TTL": self.handle_ttl,
-            "INCR": self.handle_incr,
-            "DECR": self.handle_decr,
-            "LPUSH": self.handle_generic_ok,
-            "RPUSH": self.handle_generic_ok,
-            "LPOP": self.handle_generic_nil,
-            "RPOP": self.handle_generic_nil,
-            "LRANGE": self.handle_generic_empty_array,
-            "SADD": self.handle_generic_ok,
-            "SMEMBERS": self.handle_generic_empty_array,
-            "SREM": self.handle_generic_ok,
-        }
-
     async def handle_slaveof(self, args, client_addr):
         log_extra = {'client_addr': f"{client_addr[0]}:{client_addr[1]}"}
         if len(args) != 2:
             return resp_encode(RESPError("ERR wrong number of arguments for 'slaveof' command"))
         
         master_host = args[0]
-        master_port = args[1]
+        master_port_str = args[1]
         
-        if master_host.lower() == "no" and master_port.lower() == "one":
+        try:
+            master_port = int(master_port_str)
+        except ValueError:
+            return resp_encode(RESPError("ERR invalid port number"))
+
+        if master_host.lower() == "no" and master_port_str.lower() == "one":
             self.master_info = None
             logger.warning("SLAVEOF NO ONE received. Honeypot simulating transition to master.", extra=log_extra)
             return resp_encode("OK")
@@ -659,22 +753,437 @@ db1:keys=0,expires=0,avg_ttl=0
         self.master_info = {"host": master_host, "port": master_port}
         logger.critical(
             "SLAVEOF command captured! Attacker attempting replication from master: %s:%s. "
-            "Simulating connection and potential RDB/module transfer.",
+            "Attempting to connect and retrieve potential RDB/module transfer.",
             master_host, master_port, extra=log_extra
         )
         
-        # Simulate connection to attacker's master (without actually connecting)
-        # In a real honeypot, you might try to connect or at least log the attempt
-        # and expect an incoming RDB or module push.
-        # For this high-interaction honeypot, we only log the attempt.
-        await asyncio.sleep(0.5) # Simulate some network delay
-        
-        # This is where you would ideally have a mechanism to either:
-        # 1. Attempt to connect to the attacker's master to pull a malicious RDB/module.
-        # 2. Set up a listener to receive an RDB/module if the attacker pushes it.
-        # For now, we only log and acknowledge.
+        # Attempt to connect to the attacker's "master" to retrieve a payload
+        payload_filename = os.path.join(PAYLOADS_DIR, f"payload_{int(time.time())}_{master_host}_{master_port}.bin")
+        try:
+            # We'll try to read up to 1MB of data for a "payload"
+            # Set a short timeout to avoid blocking the honeypot indefinitely
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(master_host, master_port), timeout=5
+            )
+            logger.info("Successfully connected to attacker's master %s:%s", master_host, master_port, extra=log_extra)
+            
+            payload_data = b""
+            # Read a chunk of data. Redis replication typically starts with a handshake
+            # followed by the RDB or AOF file. We'll just grab what we can.
+            try:
+                while True:
+                    chunk = await asyncio.wait_for(reader.read(4096), timeout=2) # Read in chunks with timeout
+                    if not chunk:
+                        break
+                    payload_data += chunk
+                    if len(payload_data) > 1024 * 1024 * 5: # Limit to 5MB to prevent OOM
+                        logger.warning("Payload from %s:%s exceeded 5MB, truncating.", master_host, master_port, extra=log_extra)
+                        break
+            except asyncio.TimeoutError:
+                logger.warning("Timeout while reading payload from %s:%s. Read %d bytes.", master_host, master_port, len(payload_data), extra=log_extra)
+            except Exception as read_e:
+                logger.error("Error reading payload from %s:%s: %s", master_host, master_port, read_e, exc_info=True, extra=log_extra)
+
+            writer.close()
+            await writer.wait_closed()
+
+            if payload_data:
+                with open(payload_filename, 'wb') as f:
+                    f.write(payload_data)
+                logger.critical("Captured %d bytes payload from SLAVEOF target %s:%s, saved to %s",
+                                len(payload_data), master_host, master_port, payload_filename, extra=log_extra)
+            else:
+                logger.info("No payload data received from SLAVEOF target %s:%s", master_host, master_port, extra=log_extra)
+
+        except (asyncio.TimeoutError, ConnectionRefusedError, OSError) as conn_e:
+            logger.warning("Failed to connect to SLAVEOF target %s:%s: %s", master_host, master_port, conn_e, extra=log_extra)
+        except Exception as e:
+            logger.error("Unexpected error during SLAVEOF payload retrieval from %s:%s: %s", master_host, master_port, e, exc_info=True, extra=log_extra)
         
         return resp_encode("OK")
+
+    # --- New Data Type Handlers ---
+
+    # --- Hash Commands ---
+    async def handle_hset(self, args, client_addr):
+        if len(args) < 3 or len(args) % 2 == 0:
+            return resp_encode(RESPError("ERR wrong number of arguments for 'hset' command"))
+        key = args[0]
+        current_db = self.get_current_db()
+        
+        # Initialize as dict if not exists or wrong type
+        if key not in current_db or not isinstance(current_db[key], dict):
+            current_db[key] = {}
+            added_fields = 0
+        else:
+            added_fields = 0
+        
+        hash_obj = current_db[key]
+        for i in range(1, len(args), 2):
+            field = args[i]
+            value = args[i+1]
+            if field not in hash_obj:
+                added_fields += 1
+            hash_obj[field] = value
+        logger.info("HSET key '%s' added %d fields.", key, added_fields, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+        return resp_encode(added_fields)
+
+    async def handle_hget(self, args, client_addr):
+        if len(args) != 2:
+            return resp_encode(RESPError("ERR wrong number of arguments for 'hget' command"))
+        key = args[0]
+        field = args[1]
+        current_db = self.get_current_db()
+        hash_obj = current_db.get(key)
+        if isinstance(hash_obj, dict):
+            value = hash_obj.get(field)
+            logger.info("HGET key '%s' field '%s' (value: %s)", key, field, value, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+            return resp_encode(value)
+        logger.info("HGET key '%s' field '%s' (not a hash or does not exist)", key, field, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+        return resp_encode(None) # Return nil if key is not a hash or does not exist/field not found
+
+    async def handle_hgetall(self, args, client_addr):
+        if len(args) != 1:
+            return resp_encode(RESPError("ERR wrong number of arguments for 'hgetall' command"))
+        key = args[0]
+        current_db = self.get_current_db()
+        hash_obj = current_db.get(key)
+        if isinstance(hash_obj, dict):
+            result = []
+            for field, value in hash_obj.items():
+                result.append(field)
+                result.append(value)
+            logger.info("HGETALL key '%s' (result: %s)", key, result, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+            return resp_encode(result)
+        logger.info("HGETALL key '%s' (not a hash or does not exist)", key, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+        return resp_encode([]) # Return empty array if key is not a hash or does not exist
+
+    async def handle_hdel(self, args, client_addr):
+        if len(args) < 2:
+            return resp_encode(RESPError("ERR wrong number of arguments for 'hdel' command"))
+        key = args[0]
+        fields_to_delete = args[1:]
+        current_db = self.get_current_db()
+        hash_obj = current_db.get(key)
+        deleted_count = 0
+        if isinstance(hash_obj, dict):
+            for field in fields_to_delete:
+                if field in hash_obj:
+                    del hash_obj[field]
+                    deleted_count += 1
+            if not hash_obj: # Remove key if hash becomes empty
+                del current_db[key]
+        logger.info("HDEL key '%s' deleted %d fields.", key, deleted_count, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+        return resp_encode(deleted_count)
+
+    async def handle_hexists(self, args, client_addr):
+        if len(args) != 2:
+            return resp_encode(RESPError("ERR wrong number of arguments for 'hexists' command"))
+        key = args[0]
+        field = args[1]
+        current_db = self.get_current_db()
+        hash_obj = current_db.get(key)
+        exists = 0
+        if isinstance(hash_obj, dict) and field in hash_obj:
+            exists = 1
+        logger.info("HEXISTS key '%s' field '%s' (exists: %d)", key, field, exists, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+        return resp_encode(exists)
+
+    # --- List Commands ---
+    async def handle_lpush(self, args, client_addr):
+        if len(args) < 2:
+            return resp_encode(RESPError("ERR wrong number of arguments for 'lpush' command"))
+        key = args[0]
+        elements = args[1:]
+        current_db = self.get_current_db()
+
+        if key not in current_db:
+            current_db[key] = []
+        elif not isinstance(current_db[key], list):
+            return resp_encode(RESPError(f"ERR Operation against a key holding the wrong kind of value"))
+        
+        current_db[key] = elements[::-1] + current_db[key] # Prepend elements
+        logger.info("LPUSH key '%s' added %d elements. New length: %d", key, len(elements), len(current_db[key]), extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+        return resp_encode(len(current_db[key]))
+
+    async def handle_rpush(self, args, client_addr):
+        if len(args) < 2:
+            return resp_encode(RESPError("ERR wrong number of arguments for 'rpush' command"))
+        key = args[0]
+        elements = args[1:]
+        current_db = self.get_current_db()
+
+        if key not in current_db:
+            current_db[key] = []
+        elif not isinstance(current_db[key], list):
+            return resp_encode(RESPError(f"ERR Operation against a key holding the wrong kind of value"))
+        
+        current_db[key].extend(elements) # Append elements
+        logger.info("RPUSH key '%s' added %d elements. New length: %d", key, len(elements), len(current_db[key]), extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+        return resp_encode(len(current_db[key]))
+
+    async def handle_lpop(self, args, client_addr):
+        if len(args) != 1:
+            return resp_encode(RESPError("ERR wrong number of arguments for 'lpop' command"))
+        key = args[0]
+        current_db = self.get_current_db()
+        list_obj = current_db.get(key)
+
+        if isinstance(list_obj, list) and list_obj:
+            popped_item = list_obj.pop(0) # Pop from the left (beginning)
+            if not list_obj: # Remove key if list becomes empty
+                del current_db[key]
+            logger.info("LPOP key '%s' popped '%s'. New length: %d", key, popped_item, len(list_obj), extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+            return resp_encode(popped_item)
+        logger.info("LPOP key '%s' (list empty or not a list)", key, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+        return resp_encode(None)
+
+    async def handle_rpop(self, args, client_addr):
+        if len(args) != 1:
+            return resp_encode(RESPError("ERR wrong number of arguments for 'rpop' command"))
+        key = args[0]
+        current_db = self.get_current_db()
+        list_obj = current_db.get(key)
+
+        if isinstance(list_obj, list) and list_obj:
+            popped_item = list_obj.pop() # Pop from the right (end)
+            if not list_obj: # Remove key if list becomes empty
+                del current_db[key]
+            logger.info("RPOP key '%s' popped '%s'. New length: %d", key, popped_item, len(list_obj), extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+            return resp_encode(popped_item)
+        logger.info("RPOP key '%s' (list empty or not a list)", key, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+        return resp_encode(None)
+
+    async def handle_lrange(self, args, client_addr):
+        if len(args) != 3:
+            return resp_encode(RESPError("ERR wrong number of arguments for 'lrange' command"))
+        key = args[0]
+        try:
+            start = int(args[1])
+            end = int(args[2])
+        except ValueError:
+            return resp_encode(RESPError("ERR value is not an integer or out of range"))
+
+        current_db = self.get_current_db()
+        list_obj = current_db.get(key)
+
+        if isinstance(list_obj, list):
+            # Handle negative indices as per Redis
+            if start < 0:
+                start = len(list_obj) + start
+            if end < 0:
+                end = len(list_obj) + end
+            
+            # Adjust slicing for inclusive end and bounds
+            if start > end: # Redis returns empty list if start > end
+                result = []
+            else:
+                result = list_obj[start : end + 1]
+            logger.info("LRANGE key '%s' from %d to %d. Result: %s", key, start, end, result, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+            return resp_encode(result)
+        logger.info("LRANGE key '%s' (not a list or does not exist)", key, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+        return resp_encode([]) # Return empty array if not a list or doesn't exist
+
+    async def handle_llen(self, args, client_addr):
+        if len(args) != 1:
+            return resp_encode(RESPError("ERR wrong number of arguments for 'llen' command"))
+        key = args[0]
+        current_db = self.get_current_db()
+        list_obj = current_db.get(key)
+        if isinstance(list_obj, list):
+            length = len(list_obj)
+            logger.info("LLEN key '%s'. Length: %d", key, length, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+            return resp_encode(length)
+        logger.info("LLEN key '%s' (not a list or does not exist)", key, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+        return resp_encode(0) # Return 0 if not a list or doesn't exist
+
+
+    # --- Set Commands ---
+    async def handle_sadd(self, args, client_addr):
+        if len(args) < 2:
+            return resp_encode(RESPError("ERR wrong number of arguments for 'sadd' command"))
+        key = args[0]
+        members = args[1:]
+        current_db = self.get_current_db()
+
+        if key not in current_db:
+            current_db[key] = set()
+        elif not isinstance(current_db[key], set):
+            return resp_encode(RESPError(f"ERR Operation against a key holding the wrong kind of value"))
+        
+        added_count = 0
+        for member in members:
+            if member not in current_db[key]:
+                current_db[key].add(member)
+                added_count += 1
+        logger.info("SADD key '%s' added %d members.", key, added_count, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+        return resp_encode(added_count)
+
+    async def handle_smembers(self, args, client_addr):
+        if len(args) != 1:
+            return resp_encode(RESPError("ERR wrong number of arguments for 'smembers' command"))
+        key = args[0]
+        current_db = self.get_current_db()
+        set_obj = current_db.get(key)
+        if isinstance(set_obj, set):
+            members_list = list(set_obj) # Convert to list for RESP encoding
+            logger.info("SMEMBERS key '%s'. Members: %s", key, members_list, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+            return resp_encode(members_list)
+        logger.info("SMEMBERS key '%s' (not a set or does not exist)", key, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+        return resp_encode([]) # Return empty array if not a set or doesn't exist
+
+    async def handle_srem(self, args, client_addr):
+        if len(args) < 2:
+            return resp_encode(RESPError("ERR wrong number of arguments for 'srem' command"))
+        key = args[0]
+        members_to_remove = args[1:]
+        current_db = self.get_current_db()
+        set_obj = current_db.get(key)
+        removed_count = 0
+        if isinstance(set_obj, set):
+            for member in members_to_remove:
+                if member in set_obj:
+                    set_obj.remove(member)
+                    removed_count += 1
+            if not set_obj: # Remove key if set becomes empty
+                del current_db[key]
+        logger.info("SREM key '%s' removed %d members.", key, removed_count, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+        return resp_encode(removed_count)
+
+    async def handle_sismember(self, args, client_addr):
+        if len(args) != 2:
+            return resp_encode(RESPError("ERR wrong number of arguments for 'sismember' command"))
+        key = args[0]
+        member = args[1]
+        current_db = self.get_current_db()
+        set_obj = current_db.get(key)
+        is_member = 0
+        if isinstance(set_obj, set) and member in set_obj:
+            is_member = 1
+        logger.info("SISMEMBER key '%s' member '%s' (is_member: %d)", key, member, is_member, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+        return resp_encode(is_member)
+
+    async def handle_scard(self, args, client_addr):
+        if len(args) != 1:
+            return resp_encode(RESPError("ERR wrong number of arguments for 'scard' command"))
+        key = args[0]
+        current_db = self.get_current_db()
+        set_obj = current_db.get(key)
+        if isinstance(set_obj, set):
+            cardinality = len(set_obj)
+            logger.info("SCARD key '%s'. Cardinality: %d", key, cardinality, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+            return resp_encode(cardinality)
+        logger.info("SCARD key '%s' (not a set or does not exist)", key, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+        return resp_encode(0)
+
+
+    # --- Sorted Set Commands (Simplified) ---
+    async def handle_zadd(self, args, client_addr):
+        if len(args) < 3 or len(args) % 2 != 1: # ZADD key score member [score member ...]
+            return resp_encode(RESPError("ERR wrong number of arguments for 'zadd' command"))
+        key = args[0]
+        members_scores = args[1:]
+        current_db = self.get_current_db()
+
+        # Sorted sets are stored as a list of (member, score) tuples, kept sorted
+        if key not in current_db:
+            current_db[key] = []
+        elif not (isinstance(current_db[key], list) and all(isinstance(x, tuple) and len(x) == 2 for x in current_db[key])):
+            return resp_encode(RESPError(f"ERR Operation against a key holding the wrong kind of value"))
+        
+        zset_obj = current_db[key]
+        added_count = 0
+        for i in range(0, len(members_scores), 2):
+            try:
+                score = float(members_scores[i])
+                member = members_scores[i+1]
+            except ValueError:
+                return resp_encode(RESPError("ERR value is not a valid float"))
+
+            # Remove existing member if it exists to update score
+            zset_obj = [(m, s) for m, s in zset_obj if m != member]
+            zset_obj.append((member, score))
+            added_count += 1
+        
+        # Sort the zset by score (ascending) for realism
+        zset_obj.sort(key=lambda x: x[1])
+        current_db[key] = zset_obj # Update the stored list
+        logger.info("ZADD key '%s' added/updated %d members.", key, added_count, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+        return resp_encode(added_count)
+
+
+    async def handle_zrange(self, args, client_addr):
+        if len(args) < 3: # ZRANGE key start stop [WITHSCORES]
+            return resp_encode(RESPError("ERR wrong number of arguments for 'zrange' command"))
+        key = args[0]
+        try:
+            start_idx = int(args[1])
+            stop_idx = int(args[2])
+        except ValueError:
+            return resp_encode(RESPError("ERR value is not an integer or out of range"))
+        
+        with_scores = False
+        if len(args) > 3 and args[3].upper() == "WITHSCORES":
+            with_scores = True
+
+        current_db = self.get_current_db()
+        zset_obj = current_db.get(key)
+        
+        result = []
+        if isinstance(zset_obj, list) and all(isinstance(x, tuple) and len(x) == 2 for x in zset_obj):
+            # Handle negative indices
+            if start_idx < 0:
+                start_idx = len(zset_obj) + start_idx
+            if stop_idx < 0:
+                stop_idx = len(zset_obj) + stop_idx
+
+            # Adjust slice end for inclusive behavior
+            if stop_idx >= 0:
+                stop_idx += 1 
+            
+            # Slice the sorted list
+            ranged_items = zset_obj[start_idx:stop_idx]
+
+            for member, score in ranged_items:
+                result.append(member)
+                if with_scores:
+                    result.append(str(score)) # Scores are returned as bulk strings
+            
+        logger.info("ZRANGE key '%s' from %d to %d (with_scores: %s). Result: %s", key, start_idx, stop_idx, with_scores, result, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+        return resp_encode(result)
+
+    async def handle_zrem(self, args, client_addr):
+        if len(args) < 2:
+            return resp_encode(RESPError("ERR wrong number of arguments for 'zrem' command"))
+        key = args[0]
+        members_to_remove = args[1:]
+        current_db = self.get_current_db()
+        zset_obj = current_db.get(key)
+        removed_count = 0
+        if isinstance(zset_obj, list) and all(isinstance(x, tuple) and len(x) == 2 for x in zset_obj):
+            original_len = len(zset_obj)
+            zset_obj = [(m, s) for m, s in zset_obj if m not in members_to_remove]
+            removed_count = original_len - len(zset_obj)
+            if not zset_obj: # Remove key if zset becomes empty
+                del current_db[key]
+            else:
+                current_db[key] = zset_obj # Update the stored list
+        logger.info("ZREM key '%s' removed %d members.", key, removed_count, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+        return resp_encode(removed_count)
+
+    async def handle_zcard(self, args, client_addr):
+        if len(args) != 1:
+            return resp_encode(RESPError("ERR wrong number of arguments for 'zcard' command"))
+        key = args[0]
+        current_db = self.get_current_db()
+        zset_obj = current_db.get(key)
+        if isinstance(zset_obj, list) and all(isinstance(x, tuple) and len(x) == 2 for x in zset_obj):
+            cardinality = len(zset_obj)
+            logger.info("ZCARD key '%s'. Cardinality: %d", key, cardinality, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+            return resp_encode(cardinality)
+        logger.info("ZCARD key '%s' (not a sorted set or does not exist)", key, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+        return resp_encode(0)
+
 
     # --- Generic Handlers for common commands that don't need complex logic ---
     async def handle_generic_ok(self, args, client_addr):
@@ -682,11 +1191,11 @@ db1:keys=0,expires=0,avg_ttl=0
         return resp_encode("OK")
 
     async def handle_generic_nil(self, args, client_addr):
-        # For commands like LPOP, RPOP when list is empty
+        # For commands that return nil (e.g., LPOP on empty list)
         return resp_encode(None)
     
     async def handle_generic_empty_array(self, args, client_addr):
-        # For commands like LRANGE, SMEMBERS when empty
+        # For commands that return empty array (e.g., SMEMBERS on empty set)
         return resp_encode([])
 
     async def handle_echo(self, args, client_addr):
@@ -710,10 +1219,14 @@ db1:keys=0,expires=0,avg_ttl=0
         key = args[0]
         current_db = self.get_current_db()
         try:
-            value = int(current_db.get(key, 0)) + 1
-            current_db[key] = str(value) # Store as string, as Redis does
-            logger.info("INCR key '%s' to value '%s'", key, value, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
-            return resp_encode(value)
+            value = current_db.get(key)
+            if value is None:
+                new_value = 1
+            else:
+                new_value = int(value) + 1
+            current_db[key] = str(new_value) # Store as string, as Redis does
+            logger.info("INCR key '%s' to value '%s'", key, new_value, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+            return resp_encode(new_value)
         except ValueError:
             return resp_encode(RESPError("ERR value is not an integer or out of range"))
 
@@ -723,10 +1236,14 @@ db1:keys=0,expires=0,avg_ttl=0
         key = args[0]
         current_db = self.get_current_db()
         try:
-            value = int(current_db.get(key, 0)) - 1
-            current_db[key] = str(value) # Store as string, as Redis does
-            logger.info("DECR key '%s' to value '%s'", key, value, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
-            return resp_encode(value)
+            value = current_db.get(key)
+            if value is None:
+                new_value = -1
+            else:
+                new_value = int(value) - 1
+            current_db[key] = str(new_value) # Store as string, as Redis does
+            logger.info("DECR key '%s' to value '%s'", key, new_value, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+            return resp_encode(new_value)
         except ValueError:
             return resp_encode(RESPError("ERR value is not an integer or out of range"))
 
@@ -764,10 +1281,11 @@ async def handle_client(reader, writer):
                     await writer.drain()
                     continue
                 
-                # Check if all elements in command_parts are strings
-                if not all(isinstance(part, str) for part in command_parts):
-                    logger.warning("Received malformed command (array contains non-strings): %s", command_parts, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
-                    writer.write(resp_encode(RESPError("ERR Protocol error: expected bulk strings in array")))
+                # Check if all elements in command_parts are strings (after initial decode)
+                # The _parse_bulk_string returns string, so elements of array should be strings/None
+                if not all(isinstance(part, (str, type(None))) for part in command_parts):
+                    logger.warning("Received malformed command (array contains non-strings/non-nil): %s", command_parts, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
+                    writer.write(resp_encode(RESPError("ERR Protocol error: expected bulk strings or nil in array")))
                     await writer.drain()
                     continue
 
@@ -797,6 +1315,13 @@ async def main():
     """
     Main function to start the Redis honeypot server.
     """
+    # Ensure __app_id is defined for potential future Firestore integration, though not directly used here.
+    # The current user request does not involve Firestore, so this is just a placeholder to ensure compatibility.
+    global __app_id # Access the global variable if it exists
+    app_id = "default-app-id" # Default value if __app_id is not set
+    if '__app_id' in globals(): # Check if it exists in the global scope
+        app_id = globals()['__app_id']
+    logger.info(f"Honeypot App ID: {app_id}") # Log the app ID
 
     server = await asyncio.start_server(
         handle_client,
@@ -813,6 +1338,8 @@ async def main():
     print(f"\n--- Redis Honeypot Started ---")
     print(f"Listening on {HOST}:{PORT}")
     print(f"Log file: {LOG_FILE}")
+    print(f"Persistence file: {STORAGE_FILE}")
+    print(f"Payloads directory: {PAYLOADS_DIR}")
     print(f"Authentication required: {AUTH_REQUIRED}")
     if AUTH_REQUIRED:
         print(f"Expected password: {EXPECTED_PASSWORD}")
@@ -821,6 +1348,17 @@ async def main():
 
     async with server:
         await server.serve_forever()
+
+# Register the save function to run on program exit
+# This ensures data is saved if the script is stopped gracefully (e.g., Ctrl+C)
+def graceful_shutdown_save():
+    # Create a temporary honeypot instance just to call _save_data_to_disk
+    # This might not be ideal if there are active connections, but for simple persistence it works.
+    # A more robust solution for multi-client persistence would be a shared data store or a dedicated saving task.
+    temp_honeypot = RedisHoneypot()
+    temp_honeypot._save_data_to_disk()
+
+atexit.register(graceful_shutdown_save)
 
 if __name__ == "__main__":
     try:
