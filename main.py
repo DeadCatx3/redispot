@@ -5,42 +5,35 @@ import time
 import uuid
 import re
 import os
-import atexit # For graceful shutdown persistence
+import atexit
 
 # --- Configuration ---
 HOST = '0.0.0.0'  # Bind to all available interfaces for external access
 PORT = 6379       # Standard Redis port
-LOG_FILE = 'redis_honeypot.log'
+LOG_FILE = 'redis_honeypot.log'  # File to log commands and connection attempts
 STORAGE_FILE = 'redis_honeypot_data.json' # File for key-value store persistence
 PAYLOADS_DIR = 'payloads' # Directory to store captured SLAVEOF payloads
 AUTH_REQUIRED = False     # Set to True to require AUTH command
-EXPECTED_PASSWORD = "my_secure_password" # Change this if AUTH_REQUIRED is True
+EXPECTED_PASSWORD = "my_secure_password" # Change this if AUTH_REQUIRED is True or use -a
 
 # --- Default Dummy Keys for Honeypot Session ---
-# This dictionary defines a set of default keys and values that will be present
-# in the emulated Redis database for each new client session.
-# These keys are designed to make the honeypot appear more realistic and
-# provide a starting point for attackers to interact with.
-# Note: For new data types (lists, hashes, sets, zsets), values should be
-# stored in a way that allows easy reconstruction, e.g., JSON strings or specific structures.
+# Values should be stored in a way that allows easy reconstruction
 DEFAULT_DUMMY_KEYS = {
     "web_cache:user_sessions": "a:1:{s:6:\"active\";b:1;}",
     "config:app_version": "1.0.5",
-    "users:last_login:admin": "1718224800", # Example timestamp
+    "users:last_login:admin": "1718224800",
     "temp_data:processing_queue_size": "50",
     "app:status": "online",
     "service:metrics:requests_per_sec": "120",
-    "secret:api_key": "89615-29901-27444-pl60", # A key to attract attention
+    "secret:api_key": "89615-29901-27444-pl60",
     "backup:last_run": "2025-06-12_01:00:00",
-    "online_users": {"Deadcatx3", "Guest1106", "Chapplin"}, # Example set
-    "leaderboard": [("Deadcatx3", 100), ("Guest1106", 90), ("Chapplin", 80)] # Example sorted set (member, score)
+    "online_users": {"Deadcatx3", "Guest1106", "Chapplin"},
+    "leaderboard": [("Deadcatx3", 100), ("Guest1106", 90), ("Chapplin", 80)]
 }
 
 
 # --- Logging Setup ---
-# Configure logging to console and a file.
-# The console logger is for immediate feedback during development/debugging.
-# The file logger is for capturing all honeypot interactions as threat intelligence.
+# Configure logging to console and file
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(client_addr)s - %(message)s',
@@ -68,7 +61,6 @@ logger = ClientAdapter(logger, {'client_addr': 'N/A'})
 os.makedirs(PAYLOADS_DIR, exist_ok=True)
 
 # --- RESP (Redis Serialization Protocol) Parser and Serializer ---
-
 # RESP documentation reference: https://redis.io/docs/latest/develop/reference/protocol-spec/
 
 class RESPError(Exception):
@@ -151,10 +143,6 @@ async def resp_decode(reader):
 
     Returns:
         The decoded Python object (str, int, list, None).
-
-    Raises:
-        RESPError: If the RESP message is malformed or invalid.
-        asyncio.IncompleteReadError: If the connection closes prematurely.
     """
     initial_byte = await reader.readexactly(1)
 
@@ -170,7 +158,7 @@ async def resp_decode(reader):
         length_str = await _read_until_crlf(reader)
         num_elements = int(length_str)
         if num_elements == -1:
-            return None # Null Array
+            return None 
         elements = []
         for _ in range(num_elements):
             elements.append(await resp_decode(reader))
@@ -179,7 +167,6 @@ async def resp_decode(reader):
         raise RESPError(f"Unknown RESP type prefix: {initial_byte}")
 
 # --- Honeypot Core Logic ---
-
 class RedisHoneypot:
     """
     Manages the emulated Redis state and handles commands.
@@ -197,8 +184,6 @@ class RedisHoneypot:
         self._load_data_from_disk()
 
         # Populate the default database (db0) with dummy keys for each new session
-        # This will override any existing data from disk for the dummy keys if they conflict
-        # but ensures the honeypot always starts with expected dummy data.
         self._populate_dummy_keys()
 
     def _load_data_from_disk(self):
@@ -297,7 +282,6 @@ class RedisHoneypot:
             return resp_encode("QUEUED")
 
         # Command dispatch table
-        # Add 'async' prefix to handler methods to indicate they are coroutines
         handlers = {
             "PING": self.handle_ping,
             "INFO": self.handle_info,
@@ -370,7 +354,6 @@ class RedisHoneypot:
             return resp_encode(RESPError(f"ERR unknown command '{command}'"))
 
     # --- Command Handlers ---
-
     async def handle_auth(self, args, client_addr):
         log_extra = {'client_addr': f"{client_addr[0]}:{client_addr[1]}"}
         if not AUTH_REQUIRED:
@@ -395,8 +378,7 @@ class RedisHoneypot:
         return resp_encode("PONG")
 
     async def handle_info(self, args, client_addr):
-        # Fabricated INFO output for realism and to guide attackers
-        # Updated keyspace to reflect potential dummy data
+        # Fabricated INFO output for realism and to trigger hits on masscanners
         info_output = f"""
 # Server
 redis_version:6.0.9
@@ -543,7 +525,6 @@ db1:keys={len(self.databases[1])},expires=0,avg_ttl=0
             return resp_encode(RESPError("ERR wrong number of arguments for 'keys' command"))
         pattern = args[0]
         # Simple glob-like pattern matching (not full regex)
-        # Convert glob to regex: replace '*' with '.*', '?' with '.', escape other regex chars
         regex_pattern = re.escape(pattern).replace(r'\*', '.*').replace(r'\?', '.')
         
         matched_keys = [key for key in self.get_current_db() if re.fullmatch(regex_pattern, key)]
@@ -603,7 +584,7 @@ db1:keys={len(self.databases[1])},expires=0,avg_ttl=0
             param = args[1].lower()
             # Emulate common config parameters, particularly those used in exploits
             if param == "dir":
-                return resp_encode(["dir", "/var/www/html/"]) # Common web root
+                return resp_encode(["dir", "/var/www/html/"])
             elif param == "dbfilename":
                 return resp_encode(["dbfilename", "dump.rdb"])
             elif param == "requirepass":
@@ -663,9 +644,8 @@ db1:keys={len(self.databases[1])},expires=0,avg_ttl=0
             "EVAL command with Lua script captured! Script: \n---\n%s\n---\nKeys: %s, Args: %s",
             lua_script, keys, eval_args, extra=log_extra
         )
-        # Return a plausible successful response, e.g., nil or empty array, or simulated string
-        # Do NOT actually execute the Lua script
-        return resp_encode(None) # Or resp_encode("Simulated Eval Output")
+        # Return a plausible successful response
+        return resp_encode(None)
 
     async def handle_multi(self, args, client_addr):
         if self.in_transaction:
@@ -694,8 +674,6 @@ db1:keys={len(self.databases[1])},expires=0,avg_ttl=0
                 if handler:
                     result_bytes = await handler(cmd_args, client_addr)
                     # For EXEC, the response should be the actual result of the command
-                    # after being decoded. We store the raw RESP bytes here to be
-                    # re-encoded as an array of results.
                     results.append(result_bytes)
                 else:
                     results.append(resp_encode(RESPError(f"ERR unknown command in transaction: {cmd}")))
@@ -707,8 +685,7 @@ db1:keys={len(self.databases[1])},expires=0,avg_ttl=0
         return resp_encode(results)
 
     def _get_exec_handler(self, command):
-        # This helper returns the appropriate handler for EXEC'd commands.
-        # It's a simplified mapping and doesn't re-check authentication or transaction state.
+        # This returns the appropriate handler for EXEC'd commands.
         handlers = {
             "SET": self.handle_set, "GET": self.handle_get, "DEL": self.handle_del,
             "EXISTS": self.handle_exists, "KEYS": self.handle_keys, "FLUSHALL": self.handle_flushall,
@@ -760,7 +737,6 @@ db1:keys={len(self.databases[1])},expires=0,avg_ttl=0
         # Attempt to connect to the attacker's "master" to retrieve a payload
         payload_filename = os.path.join(PAYLOADS_DIR, f"payload_{int(time.time())}_{master_host}_{master_port}.bin")
         try:
-            # We'll try to read up to 1MB of data for a "payload"
             # Set a short timeout to avoid blocking the honeypot indefinitely
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(master_host, master_port), timeout=5
@@ -772,11 +748,11 @@ db1:keys={len(self.databases[1])},expires=0,avg_ttl=0
             # followed by the RDB or AOF file. We'll just grab what we can.
             try:
                 while True:
-                    chunk = await asyncio.wait_for(reader.read(4096), timeout=2) # Read in chunks with timeout
+                    chunk = await asyncio.wait_for(reader.read(4096), timeout=5) # Read in chunks with timeout
                     if not chunk:
                         break
                     payload_data += chunk
-                    if len(payload_data) > 1024 * 1024 * 5: # Limit to 5MB to prevent OOM
+                    if len(payload_data) > 1024 * 1024 * 10: # Limit to 10MB to prevent OOM
                         logger.warning("Payload from %s:%s exceeded 5MB, truncating.", master_host, master_port, extra=log_extra)
                         break
             except asyncio.TimeoutError:
@@ -801,8 +777,6 @@ db1:keys={len(self.databases[1])},expires=0,avg_ttl=0
             logger.error("Unexpected error during SLAVEOF payload retrieval from %s:%s: %s", master_host, master_port, e, exc_info=True, extra=log_extra)
         
         return resp_encode("OK")
-
-    # --- New Data Type Handlers ---
 
     # --- Hash Commands ---
     async def handle_hset(self, args, client_addr):
@@ -968,13 +942,12 @@ db1:keys={len(self.databases[1])},expires=0,avg_ttl=0
         list_obj = current_db.get(key)
 
         if isinstance(list_obj, list):
-            # Handle negative indices as per Redis
+            # Handle negative indices
             if start < 0:
                 start = len(list_obj) + start
             if end < 0:
                 end = len(list_obj) + end
             
-            # Adjust slicing for inclusive end and bounds
             if start > end: # Redis returns empty list if start > end
                 result = []
             else:
@@ -1077,15 +1050,14 @@ db1:keys={len(self.databases[1])},expires=0,avg_ttl=0
         return resp_encode(0)
 
 
-    # --- Sorted Set Commands (Simplified) ---
+    # --- Sorted Set Commands ---
     async def handle_zadd(self, args, client_addr):
-        if len(args) < 3 or len(args) % 2 != 1: # ZADD key score member [score member ...]
+        if len(args) < 3 or len(args) % 2 != 1: # ZADD key score member
             return resp_encode(RESPError("ERR wrong number of arguments for 'zadd' command"))
         key = args[0]
         members_scores = args[1:]
         current_db = self.get_current_db()
 
-        # Sorted sets are stored as a list of (member, score) tuples, kept sorted
         if key not in current_db:
             current_db[key] = []
         elif not (isinstance(current_db[key], list) and all(isinstance(x, tuple) and len(x) == 2 for x in current_db[key])):
@@ -1210,8 +1182,8 @@ db1:keys={len(self.databases[1])},expires=0,avg_ttl=0
         key = args[0]
         if key not in self.get_current_db():
             return resp_encode(-2) # Key does not exist
-        # For simplicity, all keys in our in-memory store have no expiry
-        return resp_encode(-1) # Key exists but has no associated expire
+        # All keys in our in-memory store have no expiry
+        return resp_encode(-1)
 
     async def handle_incr(self, args, client_addr):
         if len(args) != 1:
@@ -1249,7 +1221,6 @@ db1:keys={len(self.databases[1])},expires=0,avg_ttl=0
 
 
 # --- Asyncio TCP Server ---
-
 async def handle_client(reader, writer):
     """
     Handles a single client connection. Reads commands, processes them, and sends responses.
@@ -1281,7 +1252,6 @@ async def handle_client(reader, writer):
                     await writer.drain()
                     continue
                 
-                # Check if all elements in command_parts are strings (after initial decode)
                 # The _parse_bulk_string returns string, so elements of array should be strings/None
                 if not all(isinstance(part, (str, type(None))) for part in command_parts):
                     logger.warning("Received malformed command (array contains non-strings/non-nil): %s", command_parts, extra={'client_addr': f"{client_addr[0]}:{client_addr[1]}"})
@@ -1315,14 +1285,6 @@ async def main():
     """
     Main function to start the Redis honeypot server.
     """
-    # Ensure __app_id is defined for potential future Firestore integration, though not directly used here.
-    # The current user request does not involve Firestore, so this is just a placeholder to ensure compatibility.
-    global __app_id # Access the global variable if it exists
-    app_id = "default-app-id" # Default value if __app_id is not set
-    if '__app_id' in globals(): # Check if it exists in the global scope
-        app_id = globals()['__app_id']
-    logger.info(f"Honeypot App ID: {app_id}") # Log the app ID
-
     server = await asyncio.start_server(
         handle_client,
         HOST,
@@ -1334,7 +1296,7 @@ async def main():
     addrs = ', '.join(str(sock.getsockname()) for sock in server.sockets)
     logger.info("Redis Honeypot listening on %s", addrs, extra={'client_addr': 'SERVER'})
     
-    # Message box simulation for initial server start
+    # Message box for initial server start
     print(f"\n--- Redis Honeypot Started ---")
     print(f"Listening on {HOST}:{PORT}")
     print(f"Log file: {LOG_FILE}")
@@ -1349,12 +1311,7 @@ async def main():
     async with server:
         await server.serve_forever()
 
-# Register the save function to run on program exit
-# This ensures data is saved if the script is stopped gracefully (e.g., Ctrl+C)
 def graceful_shutdown_save():
-    # Create a temporary honeypot instance just to call _save_data_to_disk
-    # This might not be ideal if there are active connections, but for simple persistence it works.
-    # A more robust solution for multi-client persistence would be a shared data store or a dedicated saving task.
     temp_honeypot = RedisHoneypot()
     temp_honeypot._save_data_to_disk()
 
